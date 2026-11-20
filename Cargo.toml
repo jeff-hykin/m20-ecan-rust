@@ -1,6 +1,6 @@
 [package]
 name = "m20-ecan"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.88"
 description = "Deep Robotics M20 (Lynx) motor-bus (ECAN, ethertype 0x4452) protocol: frame codec, joint command/state records, the vendor raw-socket transport and a pcapng/live tap reader"
