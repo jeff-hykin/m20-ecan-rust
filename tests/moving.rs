@@ -71,8 +71,7 @@ fn stand_up_target_is_symmetric_in_urdf_angles() {
     let (_, direction, frame) = tap::read_capture(CAPTURE)
         .unwrap()
         .into_iter()
-        .filter(|(t, d, _)| *d == Direction::ToBoard && *t >= 1_795_155_394_600_000_000)
-        .next()
+        .find(|(t, d, _)| *d == Direction::ToBoard && *t >= 1_795_155_394_600_000_000)
         .unwrap();
     let Ok((_, Message::JointCommands(commands))) = decode_ethernet(frame, direction) else { panic!() };
     for c in &commands {
