@@ -149,6 +149,36 @@ impl Drop for TapSocket {
     }
 }
 
+/// The sending end of the live stream, for a bus owner other than rl_deploy (the Rust controller) to feed the same
+/// readers the shim feeds. Non-blocking: a datagram the reader is not ready for is dropped and counted.
+#[cfg(unix)]
+pub struct TapSender {
+    socket: std::os::unix::net::UnixDatagram,
+    path: PathBuf,
+    pub send_dropped: u32,
+}
+
+#[cfg(unix)]
+impl TapSender {
+    pub fn new(path: impl AsRef<Path>) -> io::Result<Self> {
+        let socket = std::os::unix::net::UnixDatagram::unbound()?;
+        socket.set_nonblocking(true)?;
+        Ok(TapSender { socket, path: path.as_ref().to_path_buf(), send_dropped: 0 })
+    }
+
+    /// Send one frame as one record; false if no reader took it.
+    pub fn send(&mut self, timestamp_ns: u64, direction: Direction, frame: &[u8]) -> bool {
+        let mut datagram = Vec::with_capacity(RECORD_HEADER_LEN + frame.len());
+        TapRecord { timestamp_ns, direction, ring_dropped: 0, send_dropped: self.send_dropped, frame: frame.to_vec() }
+            .encode(&mut datagram);
+        let ok = self.socket.send_to(&datagram, &self.path).is_ok();
+        if !ok {
+            self.send_dropped = self.send_dropped.wrapping_add(1);
+        }
+        ok
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,6 +204,25 @@ mod tests {
         assert_eq!(TapRecord::decode_datagram(&datagram).unwrap(), records);
         assert!(TapRecord::decode_datagram(&datagram[..datagram.len() - 1]).is_err());
         assert!(TapRecord::decode_datagram(b"XTAP").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sender_feeds_a_reader() {
+        let dir = std::env::temp_dir().join(format!("m20-ecan-tap-sender-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("live.sock");
+        let mut sender = TapSender::new(&path).unwrap();
+        assert!(!sender.send(1, Direction::ToBoard, &[1, 2, 3]), "no reader yet");
+        let mut tap = TapSocket::bind(&path).unwrap();
+        assert!(sender.send(2, Direction::FromBoard, &[4, 5]));
+        let got = tap.recv().unwrap();
+        assert_eq!(
+            (got[0].timestamp_ns, got[0].direction, got[0].frame.clone(), got[0].send_dropped),
+            (2, Direction::FromBoard, vec![4, 5], 1)
+        );
+        drop(tap);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[cfg(unix)]
