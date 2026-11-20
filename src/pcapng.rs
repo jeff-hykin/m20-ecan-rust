@@ -120,7 +120,7 @@ impl<'a> Iterator for Reader<'a> {
             let start = self.offset;
             let block_type = u32_at(self.bytes, start)?;
             let block_len = u32_at(self.bytes, start + 4)? as usize;
-            if block_len < 12 || block_len % 4 != 0 || start + block_len > self.bytes.len() {
+            if block_len < 12 || !block_len.is_multiple_of(4) || start + block_len > self.bytes.len() {
                 return self.malformed("bad block length");
             }
             let block = &self.bytes[start..start + block_len];

@@ -93,7 +93,7 @@ impl Message {
         let bad = || FrameError::BadLength { frame_type, len: payload.len() };
         Ok(match (frame_type, direction) {
             (FrameType::Joints, Direction::ToBoard) => {
-                if payload.len() % JOINT_UNIT_LEN != 0 {
+                if !payload.len().is_multiple_of(JOINT_UNIT_LEN) {
                     return Err(bad());
                 }
                 Message::JointCommands(
@@ -101,7 +101,7 @@ impl Message {
                 )
             }
             (FrameType::Joints, Direction::FromBoard) => {
-                if payload.len() < IMU_LEN || (payload.len() - IMU_LEN) % JOINT_UNIT_LEN != 0 {
+                if payload.len() < IMU_LEN || !(payload.len() - IMU_LEN).is_multiple_of(JOINT_UNIT_LEN) {
                     return Err(bad());
                 }
                 Message::JointStates {
@@ -113,10 +113,10 @@ impl Message {
                 }
             }
             (FrameType::Battery, Direction::FromBoard) => {
-                if payload.len() % BATTERY_PACK_LEN != 0 {
+                if !payload.len().is_multiple_of(BATTERY_PACK_LEN) {
                     return Err(bad());
                 }
-                Message::Battery(payload.chunks_exact(BATTERY_PACK_LEN).map(|c| c.try_into().unwrap()).collect())
+                Message::Battery(payload.as_chunks::<BATTERY_PACK_LEN>().0.to_vec())
             }
             (FrameType::ChargeEnable, Direction::ToBoard) => Message::ChargeEnable,
             (FrameType::Version, Direction::ToBoard) => Message::VersionRequest,

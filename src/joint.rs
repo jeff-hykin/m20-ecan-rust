@@ -206,7 +206,7 @@ impl JointUnit {
 
     /// Every whole record in a payload.
     pub fn parse_all(payload: &[u8]) -> Vec<JointUnit> {
-        payload.chunks_exact(JOINT_UNIT_LEN).filter_map(JointUnit::parse).collect()
+        payload.as_chunks::<JOINT_UNIT_LEN>().0.iter().filter_map(|unit| JointUnit::parse(unit)).collect()
     }
 }
 
