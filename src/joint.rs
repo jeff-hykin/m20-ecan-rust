@@ -6,6 +6,7 @@
 //! 1  u8  CAN channel = leg (0 FL, 1 FR, 2 HL, 3 HR)
 //! 2  u16 CAN id = joint (2 hip abduction, 3 hip pitch, 4 knee, 5 wheel)
 //! 4  f32 position (rad, motor side)   8 f32 velocity (rad/s)   12 f32 torque (N m)
+//!    (wheels: position is the accumulated angle, many turns, not wrapped; it is the integral of the velocity)
 //! 16 i16 command: kp x 10 | state: motor temperature x 100 (deg C)
 //! 18 i16 command: kd x 10 | state: driver temperature x 100 (deg C)
 //! 20 u16 command: control word (4 = motor control) | state: status word
@@ -20,7 +21,11 @@ pub const JOINT_UNIT_LEN: usize = 24;
 pub const JOINT_COUNT: usize = 16;
 /// `control_word` of a normal 1 kHz joint command (`ecan::kIndexMotorControl`).
 pub const CONTROL_MOTOR: u16 = 4;
-/// Scale of the kp / kd fields on the wire (ECAN2DDS::Handler multiplies by 10).
+/// `control_word` rl_deploy sends for one cycle, all gains zero, when it leaves passive / lying for a stand-up.
+pub const CONTROL_ENABLE: u16 = 2;
+/// `status_word` of every joint throughout both recorded sessions (sitting, stand-up, walking, docking, lying).
+pub const STATUS_OK: u16 = 1;
+/// Scale of the kp / kd fields on the wire (ECAN2DDS::Handler multiplies by 10 in f32 and truncates toward zero).
 pub const GAIN_SCALE: f32 = 10.0;
 /// Scale of the temperature fields on the wire (ECAN2DDS::handleMotorData divides by 100).
 pub const TEMPERATURE_SCALE: f32 = 100.0;
@@ -239,7 +244,8 @@ impl JointCommand {
         })
     }
 
-    /// The wire record; kp and kd are rounded to the 0.1 steps the wire holds.
+    /// The wire record. kp and kd go to 0.1 steps the way rl_deploy does it: f32 times 10, truncated toward zero
+    /// (`fcvtzs`), so 1.5 x 1.3 = 1.9499999 goes out as 19 (seen on the wire during NaviCharge's start-up gains).
     pub fn to_unit(&self) -> JointUnit {
         JointUnit {
             board_id: self.board_id,
@@ -248,8 +254,8 @@ impl JointCommand {
             position: self.position,
             velocity: self.velocity,
             torque: self.torque,
-            word_a: (self.kp * GAIN_SCALE).round() as i16,
-            word_b: (self.kd * GAIN_SCALE).round() as i16,
+            word_a: (self.kp * GAIN_SCALE) as i16,
+            word_b: (self.kd * GAIN_SCALE) as i16,
             control_or_status: self.control_word,
             data_id: self.data_id,
         }
@@ -305,6 +311,13 @@ impl JointState {
     }
 }
 
+/// Checked on the robot (2026-11-20 moving session): with this calibration the stand-up target is exactly
+/// (hipx 0, hipy -/+0.708, knee +/-1.415) on every leg and the standing pose puts all four wheels 0.40-0.44 m below
+/// the body, under their hips; the measured torque follows `kp (q_cmd - q) + kd (dq_cmd - dq) + tau_ff` with slope
+/// 0.93-1.0 (r 0.94-0.999) on all 16 joints, so torque has the same sign as position; a forward command turns all
+/// four wheels negative (the MJCF wheel axis is -y), about -8.9 rad/s per commanded m/s (pure rolling at the
+/// 0.09 m radius would be -11.1), and a left turn turns the right wheels more negative than the left.
+///
 /// Motor side to URDF side, per joint: `urdf = motor * direction + offset`. Velocity and torque take the direction
 /// only. Hip pitch and knee encoders are single-turn, so their URDF angle is wrapped into (-pi, pi] (the vendor picks
 /// the 360 degree branch from the pose at startup, which lands in the same range); wheels are not wrapped.
@@ -398,6 +411,42 @@ mod tests {
         assert_eq!(command.kp, 60.0);
         assert_eq!(command.kd, -1.5);
         assert_eq!(command.to_unit(), unit);
+    }
+
+    #[test]
+    fn every_wire_gain_survives_a_round_trip() {
+        for raw in i16::MIN..=i16::MAX {
+            let unit = JointUnit {
+                board_id: 0,
+                can_channel: 0,
+                can_id: 2,
+                position: 0.0,
+                velocity: 0.0,
+                torque: 0.0,
+                word_a: raw,
+                word_b: raw,
+                control_or_status: 4,
+                data_id: 0,
+            };
+            assert_eq!(JointCommand::from_unit(&unit).unwrap().to_unit(), unit, "{raw}");
+        }
+    }
+
+    #[test]
+    fn gains_truncate_like_rl_deploy() {
+        let mut command = JointCommand::from_unit(
+            &JointUnit::parse(&[0; JOINT_UNIT_LEN])
+                .map(|mut u| {
+                    u.can_id = 2;
+                    u
+                })
+                .unwrap(),
+        )
+        .unwrap();
+        command.kp = 60.0f32 * 1.3;
+        command.kd = 1.5f32 * 1.3;
+        let unit = command.to_unit();
+        assert_eq!((unit.word_a, unit.word_b), (780, 19));
     }
 
     #[test]

@@ -30,6 +30,12 @@ for (timestamp_ns, direction, frame) in tap::read_capture(&bytes)? {
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
+What a moving session showed (2026-11-20): commanded gains per phase (passive 0/0; one enable cycle with control
+word 2 before a stand-up; stand-up kp 200 / kd 4, wheels kd 2; NaviCharge 60/1.5 with x1.3 on the legs for its first
+29 steps; walking 80/3 or 80/6, wheels kd 0.6; lie-down 300/4.5 then 0/4.5 for 2 s each), the calibration holding
+through the stand-up, torque following the PD law with the position's sign, wheel velocity in rad/s with forward
+negative, wheel position accumulated over many turns, status word 1 throughout. See `tests/moving.rs`.
+
 Examples: `cargo run --example ecan_dump capture.pcapng joints.csv`; `ecan_listen eth1 10` (Linux, receive-only,
 refuses to run while rl_deploy is up).
 
