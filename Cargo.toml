@@ -1,0 +1,17 @@
+[package]
+name = "m20-ecan"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "Deep Robotics M20 (Lynx) motor-bus (ECAN, ethertype 0x4452) protocol: frame codec, joint command/state records, the vendor raw-socket transport and a pcapng/live tap reader"
+license = "Apache-2.0"
+repository = "https://github.com/jeff-hykin/m20-ecan-rust"
+readme = "README.md"
+keywords = ["robotics", "deeprobotics", "m20", "motor", "ethernet"]
+categories = ["science::robotics", "network-programming", "parser-implementations"]
+include = ["src/**", "examples/**", "tests/**", "Cargo.toml", "README.md", "LICENSE"]
+
+[dependencies]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
