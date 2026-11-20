@@ -11,6 +11,9 @@
 //! - receive: `recvfrom(.., 1514, 0x80000000, sockaddr_ll { AF_PACKET, ifindex, halen 0, addr = own MAC }, 20)`,
 //!   keeping frames with ethertype 0x4452 and returning the body after the Ethernet header.
 //!
+//! Observed on the robot (2026-11-20, rl_deploy stopped, robot docked): eth1 received nothing in 25 s (the board sends
+//! nothing unsolicited, not even battery), and `recvfrom` with the flag on our own socket returned EPERM.
+//!
 //! On the M20 the board only answers rl_deploy's 1 kHz commands; a second sender on the bus would fight rl_deploy
 //! for the motors. Nothing in this crate sends unless [`RawSocket::send`] is called.
 
