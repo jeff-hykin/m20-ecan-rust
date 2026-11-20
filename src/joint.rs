@@ -17,6 +17,8 @@ use std::f32::consts::PI;
 
 /// Bytes per joint record.
 pub const JOINT_UNIT_LEN: usize = 24;
+/// `board_id` of every joint record on this robot (protocol constant, seen in every capture).
+pub const BOARD_ID: u8 = 0x79;
 /// Joints on the M20 (4 legs x 4).
 pub const JOINT_COUNT: usize = 16;
 /// `control_word` of a normal 1 kHz joint command (`ecan::kIndexMotorControl`).
@@ -177,7 +179,7 @@ pub struct JointUnit {
 impl JointUnit {
     pub fn parse(bytes: &[u8]) -> Option<Self> {
         let b = bytes.get(..JOINT_UNIT_LEN)?;
-        let f = |at: usize| f32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+        let f = |at: usize| f32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
         Some(JointUnit {
             board_id: b[0],
             can_channel: b[1],

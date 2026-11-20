@@ -102,11 +102,11 @@ impl RawSocket {
         self.ifindex
     }
 
-    /// Send one ECAN body (header + payload) to the board. On the robot this drives the motors.
+    /// Send one ECAN body (header + payload) to the board, retrying on EINTR. On the robot this drives the motors.
     pub fn send(&self, body: &[u8]) -> io::Result<usize> {
         let frame = ethernet::wrap(self.mac, body);
         let address = send_address(self.ifindex);
-        let sent = unsafe {
+        let sent = retry_interrupted(|| unsafe {
             libc::sendto(
                 self.fd.as_raw_fd(),
                 frame.as_ptr().cast(),
@@ -115,11 +115,15 @@ impl RawSocket {
                 (&address as *const libc::sockaddr_ll).cast(),
                 SOCKADDR_LL_LEN,
             )
-        };
-        if sent < 0 {
-            return Err(last_error("sendto"));
+        })
+        .map_err(|error| io::Error::new(error.kind(), format!("sendto: {error}")))?;
+        if sent != frame.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                format!("sendto sent {sent} of {} bytes", frame.len()),
+            ));
         }
-        Ok(sent as usize)
+        Ok(sent)
     }
 
     /// Receive one frame from the board into `body` (the bytes after the Ethernet header). `WouldBlock` when
@@ -140,24 +144,36 @@ impl RawSocket {
         }
     }
 
-    /// Receive one whole Ethernet frame, whatever its type.
+    /// Receive one whole Ethernet frame, whatever its type, retrying on EINTR.
     pub fn recv_ethernet(&self, frame: &mut [u8]) -> io::Result<usize> {
-        let mut address = recv_address(self.ifindex, self.mac);
-        let mut address_len = SOCKADDR_LL_LEN;
-        let len = unsafe {
-            libc::recvfrom(
-                self.fd.as_raw_fd(),
-                frame.as_mut_ptr().cast(),
-                frame.len().min(MAX_FRAME),
-                MSG_YSC,
-                (&mut address as *mut libc::sockaddr_ll).cast(),
-                &mut address_len,
-            )
-        };
-        if len < 0 {
-            return Err(io::Error::last_os_error());
+        retry_interrupted(|| {
+            let mut address = recv_address(self.ifindex, self.mac);
+            let mut address_len = SOCKADDR_LL_LEN;
+            unsafe {
+                libc::recvfrom(
+                    self.fd.as_raw_fd(),
+                    frame.as_mut_ptr().cast(),
+                    frame.len().min(MAX_FRAME),
+                    MSG_YSC,
+                    (&mut address as *mut libc::sockaddr_ll).cast(),
+                    &mut address_len,
+                )
+            }
+        })
+    }
+}
+
+/// Run a send/recv-style syscall until it is not interrupted by a signal: its length, or the error.
+fn retry_interrupted(mut call: impl FnMut() -> libc::ssize_t) -> io::Result<usize> {
+    loop {
+        let result = call();
+        if let Ok(len) = usize::try_from(result) {
+            return Ok(len);
         }
-        Ok(len as usize)
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
     }
 }
 
@@ -212,6 +228,27 @@ mod tests {
         assert_eq!(&bytes[..8], &[0x11, 0, 0, 0, 5, 0, 0, 0]);
         assert_eq!(bytes[11], 0);
         assert_eq!(&bytes[12..18], &[0xf2, 0x53, 0xbb, 0xa2, 0x93, 0xad]);
+    }
+
+    #[test]
+    fn interrupted_calls_are_retried() {
+        let mut calls = 0;
+        let result = retry_interrupted(|| {
+            calls += 1;
+            if calls < 3 {
+                unsafe { *libc::__errno_location() = libc::EINTR };
+                -1
+            } else {
+                7
+            }
+        });
+        assert_eq!(result.unwrap(), 7);
+        assert_eq!(calls, 3);
+        let error = retry_interrupted(|| {
+            unsafe { *libc::__errno_location() = libc::EPERM };
+            -1
+        });
+        assert_eq!(error.unwrap_err().raw_os_error(), Some(libc::EPERM));
     }
 
     #[test]

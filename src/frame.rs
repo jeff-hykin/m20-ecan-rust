@@ -200,6 +200,19 @@ pub fn encode_with_magic(
     Ok(body)
 }
 
+/// [`encode_with_magic`] for payloads this crate builds itself: one longer than a u16 length can say is cut to fit.
+pub(crate) fn encode_fitted(
+    magic: u16,
+    seq: u8,
+    flags: u8,
+    code: u8,
+    frame_type: FrameType,
+    payload: &[u8],
+) -> Vec<u8> {
+    let payload = payload.get(..usize::from(u16::MAX)).unwrap_or(payload);
+    encode_with_magic(magic, seq, flags, code, frame_type, payload).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,6 +239,12 @@ mod tests {
         let body = encode(0, 0, 0, FrameType::Battery, &[0; 20]).unwrap();
         assert!(matches!(Frame::parse(&body[..15]), Err(FrameError::Truncated { needed: 30, got: 15 })));
         assert!(matches!(Frame::parse(&body[..5]), Err(FrameError::Truncated { .. })));
+    }
+
+    #[test]
+    fn fitted_cuts_an_oversized_payload() {
+        let body = encode_fitted(MAGIC, 0, 0, 0, FrameType::Joints, &vec![1; 70_000]);
+        assert_eq!(Frame::parse(&body).unwrap().payload.len(), 65535);
     }
 
     #[test]

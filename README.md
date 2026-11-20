@@ -13,7 +13,8 @@ and reads both batteries.
 - The raw-socket transport rl_deploy uses (Linux): `AF_PACKET` with `sendto`/`recvfrom` flag `0x80000000`, the vendor
   kernel's private path that tcpdump cannot see.
 - Bus owner: `startup` (rl_deploy's startup sequence, byte for byte, tested against its capture), `owner`
-  (one frame per 1 ms tick; any command carrying a gain is replaced by the sitting command unless `allow_gains`;
+  (one frame per 1 ms tick; any command carrying a gain or feed-forward torque is replaced by the sitting command
+  unless `allow_gains`, and so is one that is not exactly one command per joint;
   charge-enable requests in place of passive ticks) and `bus` (Linux: the owner on the vendor socket, refuses while
   rl_deploy runs).
 - Passive taps: pcapng captures and the live unix-socket stream from the `ecan_tap.so` shim inside rl_deploy.

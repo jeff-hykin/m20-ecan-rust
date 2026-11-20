@@ -40,10 +40,12 @@ pub struct TapRecord {
 }
 
 impl TapRecord {
+    /// A frame longer than the u16 length field can say is cut to fit.
     pub fn encode(&self, out: &mut Vec<u8>) {
+        let frame = self.frame.get(..usize::from(u16::MAX)).unwrap_or(&self.frame);
         out.extend_from_slice(&RECORD_MAGIC);
         out.extend_from_slice(&RECORD_VERSION.to_le_bytes());
-        out.extend_from_slice(&(self.frame.len() as u16).to_le_bytes());
+        out.extend_from_slice(&u16::try_from(frame.len()).unwrap_or(u16::MAX).to_le_bytes());
         let direction: u32 = match self.direction {
             Direction::FromBoard => 1,
             Direction::ToBoard => 2,
@@ -53,7 +55,7 @@ impl TapRecord {
         out.extend_from_slice(&self.send_dropped.to_le_bytes());
         out.extend_from_slice(&0u32.to_le_bytes());
         out.extend_from_slice(&self.timestamp_ns.to_le_bytes());
-        out.extend_from_slice(&self.frame);
+        out.extend_from_slice(frame);
     }
 
     /// Every record in a datagram; stops at the first malformed one.
@@ -71,7 +73,7 @@ impl TapRecord {
                 return Err(bad("version"));
             }
             let len = u16::from_le_bytes([header[6], header[7]]) as usize;
-            let word = |i: usize| u32::from_le_bytes(header[i..i + 4].try_into().unwrap());
+            let word = |i: usize| u32::from_le_bytes([header[i], header[i + 1], header[i + 2], header[i + 3]]);
             let direction = match word(8) {
                 1 => Direction::FromBoard,
                 2 => Direction::ToBoard,
@@ -80,7 +82,7 @@ impl TapRecord {
             let start = at + RECORD_HEADER_LEN;
             let frame = datagram.get(start..start + len).ok_or_else(|| bad("short frame"))?;
             records.push(TapRecord {
-                timestamp_ns: u64::from_le_bytes(header[24..32].try_into().unwrap()),
+                timestamp_ns: u64::from_le_bytes(std::array::from_fn(|k| header[24 + k])),
                 direction,
                 ring_dropped: word(12),
                 send_dropped: word(16),
@@ -127,10 +129,15 @@ impl TapSocket {
         Ok(TapSocket { socket, path, buffer: vec![0; 1 << 16] })
     }
 
-    /// Block until the shim sends a datagram, and decode its records.
+    /// Block until the shim sends a datagram (resuming after signals), and decode its records.
     pub fn recv(&mut self) -> io::Result<Vec<TapRecord>> {
-        let len = self.socket.recv(&mut self.buffer)?;
-        TapRecord::decode_datagram(&self.buffer[..len])
+        let len = loop {
+            match self.socket.recv(&mut self.buffer) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                other => break other?,
+            }
+        };
+        TapRecord::decode_datagram(self.buffer.get(..len).unwrap_or(&self.buffer))
     }
 
     pub fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> io::Result<()> {
@@ -171,7 +178,12 @@ impl TapSender {
         let mut datagram = Vec::with_capacity(RECORD_HEADER_LEN + frame.len());
         TapRecord { timestamp_ns, direction, ring_dropped: 0, send_dropped: self.send_dropped, frame: frame.to_vec() }
             .encode(&mut datagram);
-        let ok = self.socket.send_to(&datagram, &self.path).is_ok();
+        let ok = loop {
+            match self.socket.send_to(&datagram, &self.path) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                result => break result.is_ok(),
+            }
+        };
         if !ok {
             self.send_dropped = self.send_dropped.wrapping_add(1);
         }
@@ -204,6 +216,14 @@ mod tests {
         assert_eq!(TapRecord::decode_datagram(&datagram).unwrap(), records);
         assert!(TapRecord::decode_datagram(&datagram[..datagram.len() - 1]).is_err());
         assert!(TapRecord::decode_datagram(b"XTAP").is_err());
+    }
+
+    #[test]
+    fn oversized_frame_encodes_consistently() {
+        let mut datagram = Vec::new();
+        record(Direction::ToBoard, 70_000).encode(&mut datagram);
+        let decoded = TapRecord::decode_datagram(&datagram).unwrap();
+        assert_eq!(decoded[0].frame.len(), 65535);
     }
 
     #[cfg(unix)]

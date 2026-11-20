@@ -24,8 +24,8 @@ impl EthernetHeader {
             return Err(FrameError::Truncated { needed: ETHERNET_HEADER_LEN, got: frame.len() });
         }
         let header = EthernetHeader {
-            destination: frame[0..6].try_into().unwrap(),
-            source: frame[6..12].try_into().unwrap(),
+            destination: std::array::from_fn(|i| frame[i]),
+            source: std::array::from_fn(|i| frame[6 + i]),
             ethertype: u16::from_be_bytes([frame[12], frame[13]]),
         };
         if header.ethertype != ETHERTYPE {

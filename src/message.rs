@@ -19,6 +19,9 @@ pub const BATTERY_PACK_LEN: usize = 258;
 /// Bytes of `ecan::ECAN_STATUS`.
 pub const ECAN_STATUS_LEN: usize = 256;
 
+/// Joint records one frame's u16 payload length can hold.
+const MAX_UNITS: usize = u16::MAX as usize / JOINT_UNIT_LEN;
+
 /// `ecan::ImuData`: the ECAN board's own IMU (all zero on the M20, whose body IMU is the yesense on a serial port).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ImuData {
@@ -33,9 +36,9 @@ pub struct ImuData {
 impl ImuData {
     pub fn parse(bytes: &[u8]) -> Option<Self> {
         let b = bytes.get(..IMU_LEN)?;
-        let f = |i: usize| f32::from_le_bytes(b[4 + 4 * i..8 + 4 * i].try_into().unwrap());
+        let f = |i: usize| f32::from_le_bytes(std::array::from_fn(|k| b[4 + 4 * i + k]));
         Some(ImuData {
-            timestamp: u32::from_le_bytes(b[0..4].try_into().unwrap()),
+            timestamp: u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
             roll: f(0),
             pitch: f(1),
             yaw: f(2),
@@ -137,19 +140,27 @@ impl Message {
         })
     }
 
-    /// The frame body (header + payload) rl_deploy would send for a command `seq`.
+    /// The frame body (header + payload) rl_deploy would send for a command `seq`. Commands past the 2730 a u16
+    /// length can hold are left out.
     pub fn encode_joint_commands(seq: u8, commands: &[JointCommand]) -> Vec<u8> {
+        let commands = commands.get(..MAX_UNITS).unwrap_or(commands);
         let mut payload = Vec::with_capacity(commands.len() * JOINT_UNIT_LEN);
         for command in commands {
             command.to_unit().write(&mut payload);
         }
-        frame::encode(seq, frame::FLAGS_JOINT_COMMAND, frame::CODE_JOINT_COMMAND, FrameType::Joints, &payload)
-            .expect("16 joints fit a u16 length")
+        frame::encode_fitted(
+            frame::MAGIC,
+            seq,
+            frame::FLAGS_JOINT_COMMAND,
+            frame::CODE_JOINT_COMMAND,
+            FrameType::Joints,
+            &payload,
+        )
     }
 
     /// The charge-enable request exactly as rl_deploy sends it (header magic 0).
     pub fn encode_charge_enable(seq: u8) -> Vec<u8> {
-        frame::encode_with_magic(0, seq, 0, frame::CODE_CONTROL, FrameType::ChargeEnable, &[]).unwrap()
+        frame::encode_fitted(0, seq, 0, frame::CODE_CONTROL, FrameType::ChargeEnable, &[])
     }
 
     /// A board reply carrying joint states (what the ECAN board sends; for tests and simulators).
@@ -159,6 +170,29 @@ impl Message {
         for joint in joints {
             joint.to_unit().write(&mut payload);
         }
-        frame::encode(seq, frame::FLAGS_BOARD_REPLY, frame::CODE_BOARD_REPLY, FrameType::Joints, &payload).unwrap()
+        frame::encode_fitted(
+            frame::MAGIC,
+            seq,
+            frame::FLAGS_BOARD_REPLY,
+            frame::CODE_BOARD_REPLY,
+            FrameType::Joints,
+            &payload,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::joint::JointId;
+
+    #[test]
+    fn too_many_commands_do_not_panic() {
+        let one = crate::startup::zero_commands(4)[0];
+        let body = Message::encode_joint_commands(0, &vec![one; 3000]);
+        let frame = Frame::parse(&body).unwrap();
+        assert_eq!(frame.payload.len(), MAX_UNITS * JOINT_UNIT_LEN);
+        assert!(frame.checksum_ok());
+        assert_eq!(one.joint, JointId::from_index(0).unwrap());
     }
 }

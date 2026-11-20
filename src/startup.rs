@@ -17,6 +17,19 @@ use crate::frame::{self, FrameType};
 use crate::joint::{Calibration, JointCommand, JointId, JointKind, CONTROL_MOTOR};
 use crate::message::Message;
 
+/// The bus owner's tick. matches vendor: rl_deploy's ECAN thread sends one frame per 1 ms timer cycle (capture
+/// tests/fixtures/rl_deploy_startup_20261120_1537.txt; sent slower, the board's status word reads 0x21).
+pub const TICK: Duration = Duration::from_millis(1);
+/// matches vendor: rl_deploy waits 100 ms between its version request and the setup block (startup capture).
+pub const VERSION_TO_SETUP_BLOCK: Duration = Duration::from_millis(100);
+/// matches vendor: rl_deploy waits 500 ms between the setup block and the first per-joint setup frame.
+pub const SETUP_BLOCK_TO_JOINT_SETUP: Duration = Duration::from_millis(500);
+/// matches vendor: rl_deploy's per-joint setup frames go out about 5 ms apart.
+pub const JOINT_SETUP_SPACING: Duration = Duration::from_millis(5);
+/// matches vendor: the first 1 kHz frame follows the last setup frame by 6 ms in the capture (rl_deploy's first
+/// 3-frame charge-enable burst sat in that gap).
+pub const JOINT_SETUP_TO_PROGRAM: Duration = Duration::from_millis(6);
+
 /// `code` of rl_deploy's per-joint setup frames (type 0x81).
 pub const CODE_SETUP: u8 = 0x84;
 /// rl_deploy's 0xb2 setup block.
@@ -33,7 +46,8 @@ pub const SETUP_BLOCK: [u8; 64] = {
 };
 /// The per-joint setup frames: (control word, value).
 pub const SETUP_JOINT_WORDS: [(u16, u32); 6] = [(17, 0), (1, 0), (2, 0), (23, 0), (14, 1300), (14, 1300)];
-/// (control word, frames) of the zero-gain 1 kHz part of the startup, as rl_deploy sends it.
+/// (control word, frames) of the zero-gain 1 kHz part of the startup. matches vendor: frame counts as rl_deploy sends
+/// them in its startup capture (the board reports status 1 only after this exact program at this pace).
 pub const JOINT_PROGRAM: [(Step, usize); 12] = [
     (Step::Zero(4), 3099),
     (Step::Zero(1), 3),
@@ -77,7 +91,7 @@ pub struct Scheduled {
 fn unit(joint: JointId, position: f32, word: u16, signed_zero: bool) -> JointCommand {
     let direction = if signed_zero { Calibration::m20().direction[joint.index()] } else { 1.0 };
     JointCommand {
-        board_id: 0x79,
+        board_id: crate::joint::BOARD_ID,
         joint,
         position,
         velocity: 0.0 * direction,
@@ -117,7 +131,7 @@ pub fn sitting_commands() -> Vec<JointCommand> {
 pub fn setup_joint_body(seq: u8, word: u16, value: u32) -> Vec<u8> {
     let mut payload = Vec::with_capacity(16 * 24);
     for joint in JointId::all() {
-        payload.push(0x79);
+        payload.push(crate::joint::BOARD_ID);
         payload.push(joint.leg as u8);
         payload.extend_from_slice(&joint.kind.can_id().to_le_bytes());
         payload.extend_from_slice(&value.to_le_bytes());
@@ -125,7 +139,7 @@ pub fn setup_joint_body(seq: u8, word: u16, value: u32) -> Vec<u8> {
         payload.extend_from_slice(&word.to_le_bytes());
         payload.extend_from_slice(&[0, 0]);
     }
-    frame::encode(seq, frame::FLAGS_JOINT_COMMAND, CODE_SETUP, FrameType::Type81, &payload).expect("384 bytes")
+    frame::encode_fitted(frame::MAGIC, seq, frame::FLAGS_JOINT_COMMAND, CODE_SETUP, FrameType::Type81, &payload)
 }
 
 /// The whole startup with sequence numbers from 0 (the caller may renumber).
@@ -138,21 +152,19 @@ pub fn sequence() -> Vec<Scheduled> {
         *seq = seq.wrapping_add(1);
         s
     };
-    let ms = Duration::from_millis;
+    let control = |seq: u8, frame_type: FrameType, payload: &[u8]| {
+        frame::encode_fitted(frame::MAGIC, seq, 1, frame::CODE_CONTROL, frame_type, payload)
+    };
     let s = next(&mut seq);
-    push(ms(0), Some(frame::encode(s, 1, frame::CODE_CONTROL, FrameType::Version, &[]).unwrap()), &mut out);
+    push(Duration::ZERO, Some(control(s, FrameType::Version, &[])), &mut out);
     let s = next(&mut seq);
-    push(
-        ms(100),
-        Some(frame::encode(s, 1, frame::CODE_CONTROL, FrameType::Other(0xb2), &SETUP_BLOCK).unwrap()),
-        &mut out,
-    );
+    push(VERSION_TO_SETUP_BLOCK, Some(control(s, FrameType::Other(0xb2), &SETUP_BLOCK)), &mut out);
     for (i, (word, value)) in SETUP_JOINT_WORDS.iter().enumerate() {
         let s = next(&mut seq);
-        push(if i == 0 { ms(500) } else { ms(5) }, Some(setup_joint_body(s, *word, *value)), &mut out);
+        let delay = if i == 0 { SETUP_BLOCK_TO_JOINT_SETUP } else { JOINT_SETUP_SPACING };
+        push(delay, Some(setup_joint_body(s, *word, *value)), &mut out);
     }
-    // rl_deploy's first charge-enable burst sat here: 3 cycles
-    let mut delay = ms(6);
+    let mut delay = JOINT_SETUP_TO_PROGRAM;
     let sitting = sitting_commands();
     for (step, count) in JOINT_PROGRAM {
         for _ in 0..count {
@@ -162,12 +174,12 @@ pub fn sequence() -> Vec<Scheduled> {
                 Step::Pause => None,
             };
             push(delay, body, &mut out);
-            delay = ms(1);
+            delay = TICK;
         }
     }
     for _ in 0..FINAL_ENABLE_FRAMES {
         let s = next(&mut seq);
-        push(ms(1), Some(Message::encode_joint_commands(s, &zero_commands(2))), &mut out);
+        push(TICK, Some(Message::encode_joint_commands(s, &zero_commands(2))), &mut out);
     }
     out
 }
@@ -175,6 +187,17 @@ pub fn sequence() -> Vec<Scheduled> {
 /// Whether a joint-command payload carries any gain (kp or kd) on any joint.
 pub fn has_gain(commands: &[JointCommand]) -> bool {
     commands.iter().any(|c| c.kp != 0.0 || c.kd != 0.0)
+}
+
+/// Whether commands act on a joint: any gain, or any feed-forward torque (which moves a motor with zero gains).
+pub fn is_active(commands: &[JointCommand]) -> bool {
+    has_gain(commands) || commands.iter().any(|c| c.torque != 0.0)
+}
+
+/// Whether commands are one per joint, each joint once (what the board expects every tick).
+pub fn is_complete(commands: &[JointCommand]) -> bool {
+    let mut seen = [false; crate::joint::JOINT_COUNT];
+    commands.len() == seen.len() && commands.iter().all(|c| !std::mem::replace(&mut seen[c.joint.index()], true))
 }
 
 #[cfg(test)]

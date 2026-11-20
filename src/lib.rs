@@ -7,7 +7,7 @@
 //! - [`tap`] and [`pcapng`]: passive readers for what the `ecan_tap.so` shim copies out of rl_deploy.
 //! - `transport` (Linux): the vendor-kernel raw-socket path rl_deploy sends and receives through.
 //! - [`startup`], [`owner`] and `bus` (Linux): owning the bus in rl_deploy's place: its startup, then one frame per
-//!   1 ms tick, zero gains unless allowed.
+//!   1 ms tick, zero gains and torque unless allowed.
 //!
 //! ```
 //! use m20_ecan::{decode_ethernet, message::{Direction, Message}};
@@ -16,6 +16,8 @@
 //! assert_eq!(message, Message::ChargeEnable);
 //! assert_eq!(header.seq, 3);
 //! ```
+
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 #[cfg(target_os = "linux")]
 pub mod bus;

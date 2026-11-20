@@ -129,7 +129,9 @@ impl<'a> Iterator for Reader<'a> {
                 SECTION_HEADER => self.resolutions.clear(),
                 INTERFACE_DESCRIPTION => {
                     let area = block.get(16..block_len - 4).unwrap_or(&[]);
-                    let tsresol = options(area).find(|(code, _)| *code == OPTION_IF_TSRESOL).map(|(_, v)| v[0]);
+                    let tsresol = options(area)
+                        .find(|(code, _)| *code == OPTION_IF_TSRESOL)
+                        .and_then(|(_, v)| v.first().copied());
                     self.resolutions.push(tsresol.map_or(1_000_000, resolution));
                 }
                 ENHANCED_PACKET => {
@@ -139,10 +141,10 @@ impl<'a> Iterator for Reader<'a> {
                     let interface = u32_at(block, 8)?;
                     let ticks = ((u32_at(block, 12)? as u64) << 32) | u32_at(block, 16)? as u64;
                     let captured = u32_at(block, 20)? as usize;
-                    let Some(data) = block.get(28..28 + captured) else {
+                    let Some(data) = 28usize.checked_add(captured).and_then(|end| block.get(28..end)) else {
                         return self.malformed("packet longer than its block");
                     };
-                    let area = block.get(28 + ((captured + 3) & !3)..block_len - 4).unwrap_or(&[]);
+                    let area = block.get(28 + captured.next_multiple_of(4)..block_len - 4).unwrap_or(&[]);
                     let direction = options(area)
                         .find(|(code, value)| *code == OPTION_EPB_FLAGS && value.len() >= 4)
                         .and_then(|(_, value)| match value[0] & 3 {
@@ -151,7 +153,8 @@ impl<'a> Iterator for Reader<'a> {
                             _ => None,
                         });
                     let per_second = self.resolutions.get(interface as usize).copied().unwrap_or(1_000_000);
-                    let timestamp_ns = (ticks as u128 * 1_000_000_000 / per_second as u128) as u64;
+                    let nanos = ticks as u128 * 1_000_000_000 / per_second.max(1) as u128;
+                    let timestamp_ns = u64::try_from(nanos).unwrap_or(u64::MAX);
                     return Some(Ok(Packet { timestamp_ns, interface, direction, data }));
                 }
                 _ => {}
@@ -183,16 +186,17 @@ impl<W: Write> Writer<W> {
         shb.extend_from_slice(&28u32.to_le_bytes());
         out.write_all(&shb)?;
         let name = interface_name.as_bytes();
+        let name = name.get(..usize::from(u16::MAX - 3)).unwrap_or(name);
         let mut area = Vec::new();
         area.extend_from_slice(&OPTION_IF_TSRESOL.to_le_bytes());
         area.extend_from_slice(&1u16.to_le_bytes());
         area.extend_from_slice(&[9, 0, 0, 0]);
         area.extend_from_slice(&2u16.to_le_bytes());
-        area.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        area.extend_from_slice(&u16::try_from(name.len()).unwrap_or(u16::MAX).to_le_bytes());
         area.extend_from_slice(name);
         area.resize((area.len() + 3) & !3, 0);
         area.extend_from_slice(&[0; 4]);
-        let len = 20 + area.len() as u32;
+        let len = u32::try_from(20 + area.len()).unwrap_or(u32::MAX);
         let mut idb = Vec::new();
         idb.extend_from_slice(&INTERFACE_DESCRIPTION.to_le_bytes());
         idb.extend_from_slice(&len.to_le_bytes());
@@ -205,22 +209,25 @@ impl<W: Write> Writer<W> {
         Ok(Writer { out })
     }
 
+    /// A packet too long for a pcapng block length is refused (InvalidInput).
     pub fn write_packet(&mut self, timestamp_ns: u64, direction: Option<Direction>, data: &[u8]) -> io::Result<()> {
-        let padded = (data.len() + 3) & !3;
+        let padded = data.len().next_multiple_of(4);
+        let too_long = || io::Error::new(io::ErrorKind::InvalidInput, "packet too long for pcapng");
+        let len = u32::try_from(32 + padded + 12).map_err(|_| too_long())?;
+        let captured = u32::try_from(data.len()).map_err(|_| too_long())?;
         let flags = match direction {
             Some(Direction::FromBoard) => 1u32,
             Some(Direction::ToBoard) => 2,
             None => 0,
         };
-        let len = (32 + padded + 12) as u32;
         let mut block = Vec::with_capacity(len as usize);
         block.extend_from_slice(&ENHANCED_PACKET.to_le_bytes());
         block.extend_from_slice(&len.to_le_bytes());
         block.extend_from_slice(&0u32.to_le_bytes());
         block.extend_from_slice(&((timestamp_ns >> 32) as u32).to_le_bytes());
         block.extend_from_slice(&(timestamp_ns as u32).to_le_bytes());
-        block.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        block.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        block.extend_from_slice(&captured.to_le_bytes());
+        block.extend_from_slice(&captured.to_le_bytes());
         block.extend_from_slice(data);
         block.resize(28 + padded, 0);
         block.extend_from_slice(&OPTION_EPB_FLAGS.to_le_bytes());
@@ -260,6 +267,28 @@ mod tests {
     #[test]
     fn rejects_other_files() {
         assert!(matches!(Reader::new(b"not a capture at all"), Err(PcapngError::NotPcapng)));
+    }
+
+    #[test]
+    fn empty_tsresol_option_is_not_a_panic() {
+        let mut bytes = Writer::new(Vec::new(), "eth1").unwrap().into_inner();
+        // the interface block's if_tsresol option (code 9, length 1) rewritten to length 0
+        let at = 28 + 16;
+        assert_eq!(u16_at(&bytes, at), Some(OPTION_IF_TSRESOL));
+        bytes[at + 2] = 0;
+        let mut writer = Writer { out: bytes };
+        writer.write_packet(7, None, &[1]).unwrap();
+        let bytes = writer.into_inner();
+        assert!(Reader::new(&bytes).unwrap().all(|p| p.is_ok()));
+    }
+
+    #[test]
+    fn huge_timestamps_saturate() {
+        let mut writer = Writer::new(Vec::new(), "eth1").unwrap();
+        writer.write_packet(u64::MAX, None, &[]).unwrap();
+        let bytes = writer.into_inner();
+        let packet = Reader::new(&bytes).unwrap().next().unwrap().unwrap();
+        assert_eq!(packet.timestamp_ns, u64::MAX);
     }
 
     #[test]
